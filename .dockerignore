@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Excludes credentials, captures, artifacts, and local metadata from builds.
+.git
+.github
+.env
+.env.*
+!.env.example
+proxy.env
+secrets
+artifacts
+local
+captures
+logs
+local-acceptance.env
+*.pcap
+*.har
+*.trace
+*.pem
+*.key
+*.crt
+__pycache__
+*.pyc

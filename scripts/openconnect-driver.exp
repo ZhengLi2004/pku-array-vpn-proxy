@@ -1,0 +1,204 @@
+#!/usr/bin/expect -f
+# SPDX-License-Identifier: Apache-2.0
+# Feeds one authenticated Array session cookie into a pinned OpenConnect process.
+
+log_user 1
+exp_internal 0
+set timeout -1
+
+# Stops and reaps the spawned OpenConnect process when it exists.
+proc stop_child {} {
+    global spawn_id
+
+    if {[info exists spawn_id]} {
+        catch {exec kill -TERM [exp_pid -i $spawn_id]}
+        catch {close -i $spawn_id}
+        catch {wait -i $spawn_id}
+    }
+}
+
+# Obtains one bounded session cookie from the isolated authentication sidecar.
+#
+# Args:
+#   candidate: Verified public IPv4 address selected for this attempt.
+#
+# Returns:
+#   The sanitized ANsession cookie assignment on success.
+#
+# Side effects:
+#   Exits with a permanent or transient status when the sidecar fails.
+proc obtain_cookie {candidate} {
+    set failed [catch {
+        exec /usr/local/bin/array-auth-client $candidate 2>@1
+    } output options]
+
+    if {!$failed} {
+        if {[string length $output] < 12 || [string length $output] > 8192 ||
+            ![regexp {^ANsession[A-Za-z0-9_.-]*=[^\x00-\x20\x7f;]+$} $output]} {
+            puts stderr "ARRAY_AUTH_PERMANENT:COOKIE"
+            exit 64
+        }
+
+        return $output
+    }
+
+    set child_exit 75
+
+    if {[dict exists $options -errorcode]} {
+        set error_code [dict get $options -errorcode]
+
+        if {[llength $error_code] >= 3 && [lindex $error_code 0] eq "CHILDSTATUS"} {
+            set child_exit [lindex $error_code 2]
+        }
+    }
+
+    set sanitized ""
+    set output_lines [split $output "\n"]
+
+    if {[llength $output_lines] == 2 &&
+        [lindex $output_lines 1] eq "child process exited abnormally"} {
+        set sanitized [lindex $output_lines 0]
+    }
+
+    if {$child_exit == 64} {
+        if {[regexp {^ARRAY_AUTH_PERMANENT:([A-Z0-9_]+)$} $sanitized -> reason]} {
+            puts stderr "ARRAY_AUTH_PERMANENT:$reason"
+        } else {
+            puts stderr "ARRAY_AUTH_PERMANENT:CLIENT"
+        }
+
+        exit 64
+    }
+
+    if {$child_exit == 75 &&
+        [regexp {^ARRAY_AUTH_TRANSIENT:([A-Z0-9_]+)$} $sanitized -> reason]} {
+        puts stderr "ARRAY_AUTH_TRANSIENT:$reason"
+    } else {
+        puts stderr "ARRAY_AUTH_TRANSIENT:CLIENT"
+    }
+
+    exit 75
+}
+
+trap {
+    stop_child
+    exit 0
+} {SIGTERM SIGINT}
+
+if {$argc != 1} {
+    puts stderr "DRIVER_USAGE_ERROR"
+    exit 64
+}
+
+set candidate [lindex $argv 0]
+
+if {![regexp {^[0-9]{1,3}(\.[0-9]{1,3}){3}$} $candidate]} {
+    puts stderr "DRIVER_CANDIDATE_INVALID"
+    exit 64
+}
+
+set array_host "arrayvpn.pku.edu.cn"
+set pin_path "/etc/arrayvpn/servercert-pins.txt"
+
+set pin_failed [catch {
+    set pin_channel [open $pin_path r]
+    set pin_text [read $pin_channel]
+    close $pin_channel
+}]
+
+if {$pin_failed} {
+    puts stderr "ARRAY_PERMANENT:PIN_FILE"
+    exit 64
+}
+
+set command [list \
+    /usr/local/sbin/openconnect \
+    --protocol=array \
+    --gnutls-priority=NORMAL:-VERS-SSL3.0:+SHA256:%COMPAT:%UNSAFE_RENEGOTIATION:-3DES-CBC:-ARCFOUR-128 \
+    --script-tun \
+    --script "ocproxy -D 1080 -g" \
+    --no-dtls \
+    --disable-ipv6 \
+    --cookie-on-stdin \
+    --non-inter \
+    --resolve=[format "%s:%s" $array_host $candidate]]
+
+set pin_count 0
+
+foreach pin [split $pin_text "\n"] {
+    if {$pin ne ""} {
+        if {![regexp {^pin-sha256:[A-Za-z0-9+/]{43}=$} $pin]} {
+            puts stderr "ARRAY_PERMANENT:PIN_FILE"
+            exit 64
+        }
+
+        incr pin_count
+
+        if {$pin_count > 8} {
+            puts stderr "ARRAY_PERMANENT:PIN_FILE"
+            exit 64
+        }
+
+        lappend command --servercert=$pin
+    }
+}
+
+if {$pin_count == 0} {
+    puts stderr "ARRAY_PERMANENT:PIN_FILE"
+    exit 64
+}
+
+lappend command [format "https://%s/" $array_host]
+set stty_init "-echo"
+set session_cookie [obtain_cookie $candidate]
+spawn -noecho {*}$command
+send -- "$session_cookie\r"
+unset session_cookie
+set certificate_warning 0
+set session_rejected 0
+
+expect {
+    -nocase -re {(authgroup|username|password):} {
+        puts stderr "ARRAY_PERMANENT:UNEXPECTED_AUTH_PROMPT"
+        stop_child
+        exit 64
+    }
+
+    -nocase -re {connected to HTTPS on [^\r\n]+} {
+        set certificate_warning 0
+        exp_continue
+    }
+
+    -nocase -re {(server certificate verify failed|certificate verification failed|certificate.*(mismatch|does not match|not trusted|untrusted))} {
+        set certificate_warning 1
+        exp_continue
+    }
+
+    -exact "Cookie was rejected by server; exiting." {
+        set session_rejected 1
+        exp_continue
+    }
+
+    eof {
+    }
+}
+
+set child_status [wait]
+
+if {$certificate_warning} {
+    exit 64
+}
+
+if {$session_rejected} {
+    exit 65
+}
+
+if {[lindex $child_status 2] != 0} {
+    exit 75
+}
+
+if {[lindex $child_status 3] == 0} {
+    exit 0
+}
+
+exit 75

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Limits the local authentication build context to audited source and package inputs.
+**
+!Dockerfile.isecsp-auth
+!src/
+!src/auth-ipc/
+!src/auth-ipc/client.c
+!src/auth-ipc/protocol.h
+!src/isecsp-auth/
+!src/isecsp-auth/**
+!config/
+!config/servercert-pins.txt
+!local/
+!local/iSecSP_ubuntu_2.4.0.deb
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md

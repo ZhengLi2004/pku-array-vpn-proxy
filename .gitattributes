@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# Keeps the executable Expect driver on Unix line endings and classified as Tcl.
+*.exp text eol=lf
+scripts/openconnect-driver.exp linguist-language=Tcl

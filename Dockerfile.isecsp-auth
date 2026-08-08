@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# SPDX-License-Identifier: Apache-2.0
+# Builds a local-only auth sidecar from a user-supplied official iSecSP package.
+
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+FROM ${UBUNTU_IMAGE} AS ubuntu-ca
+ARG UBUNTU_APT_MIRROR
+
+RUN --mount=type=cache,id=apt-ubuntu-24.04-amd64-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-ubuntu-24.04-amd64-lists,target=/var/lib/apt/lists,sharing=locked \
+    if test -n "$UBUNTU_APT_MIRROR"; then \
+    case "$UBUNTU_APT_MIRROR" in https://*) ;; *) exit 64 ;; esac; \
+    bootstrap_mirror="http://${UBUNTU_APT_MIRROR#https://}"; \
+    sed -i \
+    -e "s|http://archive.ubuntu.com/ubuntu/|${bootstrap_mirror%/}/|g" \
+    -e "s|http://security.ubuntu.com/ubuntu/|${bootstrap_mirror%/}/|g" \
+    /etc/apt/sources.list.d/ubuntu.sources; \
+    fi \
+    && apt-get \
+    -o APT::Update::Error-Mode=any \
+    -o Acquire::AllowInsecureRepositories=false \
+    -o Acquire::AllowDowngradeToInsecureRepositories=false \
+    update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && if test -n "$UBUNTU_APT_MIRROR"; then \
+    sed -i \
+    "s|http://${UBUNTU_APT_MIRROR#https://}|${UBUNTU_APT_MIRROR%/}|g" \
+    /etc/apt/sources.list.d/ubuntu.sources; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get \
+    -o APT::Update::Error-Mode=any \
+    -o Acquire::AllowInsecureRepositories=false \
+    -o Acquire::AllowDowngradeToInsecureRepositories=false \
+    update; \
+    fi
+
+FROM ubuntu-ca AS builder
+ARG ISECSP_DEB_SHA256=4b062dfa4a9a89cbb60d538b1cc3cb47d014ff91e907db16c891fcd9ebd91d6c
+ARG ISECSP_LIBRARY_SHA256=0a20b9f9760c845e805fdbdded968100344c2cc3026ef1134dd81ae664135787
+ARG ISEC_LIBRARY_SHA256=cf9df4e6726d95c2f06d38efe5a07684520c90300b147e8915a6c130d7c9469e
+
+RUN --mount=type=cache,id=apt-ubuntu-24.04-amd64-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-ubuntu-24.04-amd64-lists,target=/var/lib/apt/lists,sharing=locked \
+    apt-get \
+    -o APT::Update::Error-Mode=any \
+    -o Acquire::AllowInsecureRepositories=false \
+    -o Acquire::AllowDowngradeToInsecureRepositories=false \
+    update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    binutils build-essential dpkg-dev
+
+WORKDIR /build
+COPY src/auth-ipc/protocol.h /build/src/auth-ipc/protocol.h
+COPY src/auth-ipc/client.c /build/src/auth-ipc/client.c
+COPY src/isecsp-auth/ /build/src/isecsp-auth/
+
+# The package is mounted only for this build step. Its maintainer scripts and
+# executables are never run, and the package itself is absent from all layers.
+RUN --mount=type=bind,source=local/iSecSP_ubuntu_2.4.0.deb,target=/build/isecsp.deb,readonly \
+    echo "$ISECSP_DEB_SHA256  /build/isecsp.deb" | sha256sum -c - \
+    && test "$(dpkg-deb -f /build/isecsp.deb Package)" = isecsp \
+    && test "$(dpkg-deb -f /build/isecsp.deb Version)" = 2.4.0 \
+    && test "$(dpkg-deb -f /build/isecsp.deb Architecture)" = amd64 \
+    && install -d -m 0755 /build/extracted /out/bin /out/lib /out/licenses \
+    && dpkg-deb -x /build/isecsp.deb /build/extracted \
+    && test -f /build/extracted/opt/iSecSP/libvl3vpn.so \
+    && test ! -L /build/extracted/opt/iSecSP/libvl3vpn.so \
+    && test -f /build/extracted/opt/iSecSP/libisec.so \
+    && test ! -L /build/extracted/opt/iSecSP/libisec.so \
+    && echo "$ISECSP_LIBRARY_SHA256  /build/extracted/opt/iSecSP/libvl3vpn.so" | sha256sum -c - \
+    && echo "$ISEC_LIBRARY_SHA256  /build/extracted/opt/iSecSP/libisec.so" | sha256sum -c - \
+    && readelf -h /build/extracted/opt/iSecSP/libvl3vpn.so | \
+    grep -Fq 'Machine:                           Advanced Micro Devices X86-64' \
+    && readelf -h /build/extracted/opt/iSecSP/libisec.so | \
+    grep -Fq 'Machine:                           Advanced Micro Devices X86-64' \
+    && make -C /build/src/isecsp-auth -j"$(getconf _NPROCESSORS_ONLN)" \
+    && install -m 0755 /build/src/isecsp-auth/isecsp-auth-server /out/bin/ \
+    && install -m 0755 /build/src/isecsp-auth/isecsp-auth-client /out/bin/ \
+    && install -m 0555 /build/extracted/opt/iSecSP/libvl3vpn.so /out/lib/ \
+    && install -m 0555 /build/extracted/opt/iSecSP/libisec.so /out/lib/ \
+    && install -m 0444 /build/extracted/opt/iSecSP/THIRD_PARTY_LICENSES.txt \
+    /out/licenses/
+
+FROM ubuntu-ca
+ARG UBUNTU_APT_MIRROR
+LABEL org.opencontainers.image.title="PKU Array VPN local iSecSP authentication sidecar"
+LABEL org.opencontainers.image.description="Local-only, hash-locked iSecSP authentication component"
+LABEL org.opencontainers.image.source="https://github.com/ZhengLi2004/pku-array-vpn-proxy"
+LABEL org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-iSecSP-Proprietary"
+
+RUN --mount=type=cache,id=apt-ubuntu-24.04-amd64-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-ubuntu-24.04-amd64-lists,target=/var/lib/apt/lists,sharing=locked \
+    apt-get \
+    -o APT::Update::Error-Mode=any \
+    -o Acquire::AllowInsecureRepositories=false \
+    -o Acquire::AllowDowngradeToInsecureRepositories=false \
+    update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libuuid1 libxml2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system arrayvpn \
+    && useradd --system --gid arrayvpn --no-create-home \
+    --home-dir /nonexistent --shell /usr/sbin/nologin arrayvpn \
+    && install -d -m 0755 /opt/isecsp /etc/arrayvpn /run/isecsp \
+    /usr/share/licenses/isecsp
+
+COPY --from=builder /out/lib/libvl3vpn.so /opt/isecsp/libvl3vpn.so
+COPY --from=builder /out/lib/libisec.so /opt/isecsp/libisec.so
+COPY --from=builder /out/bin/isecsp-auth-server /usr/local/sbin/isecsp-auth-server
+COPY --from=builder /out/bin/isecsp-auth-client /usr/local/bin/isecsp-auth-client
+COPY --from=builder /out/licenses/THIRD_PARTY_LICENSES.txt \
+    /usr/share/licenses/isecsp/THIRD_PARTY_LICENSES.txt
+
+COPY config/servercert-pins.txt /etc/arrayvpn/servercert-pins.txt
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/pku-array-vpn-proxy/
+ENV HOME=/nonexistent
+USER arrayvpn:arrayvpn
+WORKDIR /run/isecsp
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/sbin/isecsp-auth-server"]

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Prevents credentials, local captures, test artifacts, and caches from tracking.
+/secrets/
+/.env
+/.env.*
+!/.env.example
+/proxy.env
+/artifacts/
+/local/
+/captures/
+/logs/
+/local-acceptance.env
+*.pcap
+*.har
+*.trace
+*.pem
+*.key
+*.crt
+__pycache__/
+*.pyc

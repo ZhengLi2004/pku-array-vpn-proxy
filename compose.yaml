@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+# Runs the unprivileged SOCKS tunnel and isolated credential-bearing auth sidecar.
+services:
+  # Publishes only the loopback TCP SOCKS5 endpoint and owns no credentials.
+  pku-array-vpn:
+    image: ${PKU_ARRAY_VPN_IMAGE:-pku-array-vpn-proxy:local}
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+      args:
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
+
+    ports:
+      - "127.0.0.1:11080:1080/tcp"
+
+    environment:
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-https://its.pku.edu.cn/service_1_vpn2.jsp}
+      HEALTHCHECK_INTERVAL: ${HEALTHCHECK_INTERVAL:-60}
+      HEALTHCHECK_MAX_FAILS: ${HEALTHCHECK_MAX_FAILS:-3}
+      HEALTHCHECK_START_TIMEOUT: ${HEALTHCHECK_START_TIMEOUT:-180}
+
+    read_only: true
+    user: "${ARRAYVPN_UID:?run ./scripts/init-secrets.sh}:${ARRAYVPN_GID:?run ./scripts/init-secrets.sh}"
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /run/arrayvpn:rw,nosuid,nodev,noexec,size=16m,uid=${ARRAYVPN_UID:?run ./scripts/init-secrets.sh},gid=${ARRAYVPN_GID:?run ./scripts/init-secrets.sh},mode=0700
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/healthcheck.sh" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+    logging:
+      driver: json-file
+
+      options:
+        max-size: 5m
+        max-file: "3"
+
+    networks:
+      - pku_array
+
+  # Runs the local-only iSecSP authentication adapter in the tunnel namespace.
+  array-auth:
+    image: pku-array-vpn-auth:isecsp-local
+
+    build:
+      context: .
+      dockerfile: Dockerfile.isecsp-auth
+
+      args:
+        UBUNTU_IMAGE: ${UBUNTU_IMAGE:-ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea}
+        UBUNTU_APT_MIRROR: ${UBUNTU_APT_MIRROR:-}
+
+    network_mode: "service:pku-array-vpn"
+
+    depends_on:
+      pku-array-vpn:
+        condition: service_started
+        restart: true
+
+    secrets:
+      - vpn_username
+      - vpn_password
+      - id_card_last6
+      - phone_missing4
+
+    read_only: true
+    user: "${ARRAYVPN_UID:?run ./scripts/init-secrets.sh}:${ARRAYVPN_GID:?run ./scripts/init-secrets.sh}"
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /run/isecsp:rw,nosuid,nodev,noexec,size=16m,uid=${ARRAYVPN_UID:?run ./scripts/init-secrets.sh},gid=${ARRAYVPN_GID:?run ./scripts/init-secrets.sh},mode=0700
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/isecsp-auth-client", "--healthcheck" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+
+      options:
+        max-size: 5m
+        max-file: "3"
+
+secrets:
+  vpn_username:
+    file: ./secrets/vpn_username
+
+  vpn_password:
+    file: ./secrets/vpn_password
+
+  id_card_last6:
+    file: ./secrets/id_card_last6
+
+  phone_missing4:
+    file: ./secrets/phone_missing4
+
+networks:
+  pku_array:
+    driver: bridge
