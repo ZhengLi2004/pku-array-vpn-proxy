@@ -97,6 +97,18 @@ if {![regexp {^[0-9]{1,3}(\.[0-9]{1,3}){3}$} $candidate]} {
     exit 64
 }
 
+set data_transport "tls"
+
+if {[info exists env(VPN_DATA_TRANSPORT)] &&
+    $env(VPN_DATA_TRANSPORT) ne ""} {
+    set data_transport $env(VPN_DATA_TRANSPORT)
+}
+
+if {![regexp {^(auto|tls)$} $data_transport]} {
+    puts stderr "DRIVER_TRANSPORT_INVALID"
+    exit 64
+}
+
 set array_host "arrayvpn.pku.edu.cn"
 set pin_path "/etc/arrayvpn/servercert-pins.txt"
 
@@ -116,12 +128,17 @@ set command [list \
     --protocol=array \
     --gnutls-priority=NORMAL:-VERS-SSL3.0:+SHA256:%COMPAT:%UNSAFE_RENEGOTIATION:-3DES-CBC:-ARCFOUR-128 \
     --script-tun \
-    --script "ocproxy -D 1080 -g" \
-    --no-dtls \
+    --script "ocproxy -D 1080 -g"]
+
+if {$data_transport eq "tls"} {
+    lappend command --no-dtls
+}
+
+lappend command \
     --disable-ipv6 \
     --cookie-on-stdin \
     --non-inter \
-    --resolve=[format "%s:%s" $array_host $candidate]]
+    --resolve=[format "%s:%s" $array_host $candidate]
 
 set pin_count 0
 
@@ -155,6 +172,7 @@ spawn -noecho {*}$command
 send -- "$session_cookie\r"
 unset session_cookie
 set certificate_warning 0
+set session_accepted 0
 set session_rejected 0
 
 expect {
@@ -166,6 +184,11 @@ expect {
 
     -nocase -re {connected to HTTPS on [^\r\n]+} {
         set certificate_warning 0
+        exp_continue
+    }
+
+    -nocase -re {configured as [^\r\n]*with SSL connected} {
+        set session_accepted 1
         exp_continue
     }
 
@@ -190,6 +213,10 @@ if {$certificate_warning} {
 }
 
 if {$session_rejected} {
+    if {$session_accepted} {
+        exit 75
+    }
+
     exit 65
 }
 

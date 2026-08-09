@@ -139,11 +139,22 @@ load_proxy_file "$proxy_file"
 
 if [[ $scope == all ]]; then
 	ocproxy_commit=$(sed -n 's/^OCPROXY_COMMIT=//p' versions.env)
+	ocproxy_patch_sha=$(sed -n 's/^OCPROXY_PERFORMANCE_PATCH_SHA256=//p' versions.env)
+	ocproxy_patch=$repo_dir/patches/ocproxy-upload-performance.patch
 
 	[[ $ocproxy_commit =~ ^[0-9a-f]{40}$ ]] ||
 		fail 'versions.env has an invalid OCPROXY_COMMIT'
 
-	ocproxy_source=upstream-git
+	[[ $ocproxy_patch_sha =~ ^[0-9a-f]{64}$ ]] ||
+		fail 'versions.env has an invalid OCPROXY_PERFORMANCE_PATCH_SHA256'
+
+	[[ -f $ocproxy_patch && ! -L $ocproxy_patch ]] ||
+		fail 'the locked ocproxy performance patch is missing or is a symlink'
+
+	[[ $(sha256sum "$ocproxy_patch" | awk '{print $1}') == "$ocproxy_patch_sha" ]] ||
+		fail 'the ocproxy performance patch does not match versions.env'
+
+	ocproxy_source=upstream-git+locked-performance-patch
 else
 	ocproxy_source=not-applicable
 fi

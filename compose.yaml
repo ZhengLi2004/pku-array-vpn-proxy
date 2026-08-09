@@ -20,6 +20,7 @@ services:
       HEALTHCHECK_INTERVAL: ${HEALTHCHECK_INTERVAL:-60}
       HEALTHCHECK_MAX_FAILS: ${HEALTHCHECK_MAX_FAILS:-3}
       HEALTHCHECK_START_TIMEOUT: ${HEALTHCHECK_START_TIMEOUT:-180}
+      VPN_DATA_TRANSPORT: ${VPN_DATA_TRANSPORT:-tls}
 
     read_only: true
     user: "${ARRAYVPN_UID:?run ./scripts/init-secrets.sh}:${ARRAYVPN_GID:?run ./scripts/init-secrets.sh}"

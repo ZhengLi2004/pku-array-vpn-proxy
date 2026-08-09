@@ -42,6 +42,37 @@ if [[ $driver_output == *'synthetic-cookie'* ]]; then
 	exit 1
 fi
 
+auto_output=$(
+	docker run "${common_args[@]}" \
+		--env VPN_DATA_TRANSPORT=auto \
+		--entrypoint /usr/local/bin/openconnect-driver.exp \
+		"$image" 192.0.2.1
+)
+
+[[ $auto_output == *'Connected to HTTPS on fake.invalid with ciphersuite TEST'* ]]
+
+tls_output=$(
+	docker run "${common_args[@]}" \
+		--env VPN_DATA_TRANSPORT=tls \
+		--entrypoint /usr/local/bin/openconnect-driver.exp \
+		"$image" 192.0.2.1
+)
+
+[[ $tls_output == *'Connected to HTTPS on fake.invalid with ciphersuite TEST'* ]]
+
+set +e
+
+invalid_transport_output=$(
+	docker run "${common_args[@]}" \
+		--env VPN_DATA_TRANSPORT=dtls \
+		--entrypoint /usr/local/bin/openconnect-driver.exp \
+		"$image" 192.0.2.1 2>&1
+)
+
+invalid_transport_status=$?
+set -e
+[[ $invalid_transport_status -eq 64 ]]
+[[ $invalid_transport_output == 'DRIVER_TRANSPORT_INVALID' ]]
 set +e
 
 certificate_output=$(
@@ -121,4 +152,19 @@ session_rejected_status=$?
 set -e
 [[ $session_rejected_status -eq 65 ]]
 [[ $session_rejected_output == *'Cookie was rejected by server; exiting.'* ]]
+set +e
+
+accepted_then_expired_output=$(
+	docker run "${common_args[@]}" \
+		--env FAKE_SESSION_ACCEPTED=1 \
+		--env FAKE_COOKIE_REJECT=1 \
+		--entrypoint /usr/local/bin/openconnect-driver.exp \
+		"$image" 192.0.2.1 2>&1
+)
+
+accepted_then_expired_status=$?
+set -e
+[[ $accepted_then_expired_status -eq 75 ]]
+[[ $accepted_then_expired_output == *'Configured as 192.0.2.10, with SSL connected'* ]]
+[[ $accepted_then_expired_output == *'Cookie was rejected by server; exiting.'* ]]
 echo 'openconnect_driver_test=ok'

@@ -21,8 +21,13 @@ for that exact build.
 - License: BSD 3-Clause (`BSD-3-Clause`)
 
 The Docker builder fetches this exact upstream commit and verifies the checked
-out object before compilation. The runtime image carries ocproxy's `LICENSE`,
-`AUTHORS`, and lwIP's `COPYING` under `/usr/share/licenses/`.
+out object before compilation. It then applies the repository-carried
+`patches/ocproxy-upload-performance.patch`, locked by SHA-256
+`beab1230018ac3fc3c9635a060b5c251a4c3707eee51c94425c309a1ed1232bf`.
+The patch adds bounded VPNFD backpressure and adjusts lwIP upload buffers; the
+modified component remains subject to ocproxy's and lwIP's BSD terms. The
+runtime image carries ocproxy's `LICENSE`, `AUTHORS`, and lwIP's `COPYING` under
+`/usr/share/licenses/`.
 
 ocproxy/vpnns includes copyright notices for David Edmondson, Kevin Cernekee,
 and Google Inc.; the complete notices remain in the fetched source tree and the

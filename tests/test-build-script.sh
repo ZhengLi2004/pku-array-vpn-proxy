@@ -25,9 +25,10 @@ fail() {
 }
 
 valid_repo=$work_dir/valid-repo
-mkdir -p "$valid_repo/scripts" "$valid_repo/local"
+mkdir -p "$valid_repo/scripts" "$valid_repo/local" "$valid_repo/patches"
 cp "$repo_dir/scripts/build.sh" "$valid_repo/scripts/"
 cp "$repo_dir/versions.env" "$valid_repo/versions.env"
+cp "$repo_dir/patches/ocproxy-upload-performance.patch" "$valid_repo/patches/"
 printf 'synthetic package fixture' >"$valid_repo/local/iSecSP_ubuntu_2.4.0.deb"
 
 synthetic_deb_sha=$(sha256sum "$valid_repo/local/iSecSP_ubuntu_2.4.0.deb" |
@@ -52,6 +53,27 @@ fi
 grep -Fq 'invalid OCPROXY_COMMIT' "$work_dir/invalid-lock.out" ||
 	fail 'invalid ocproxy commit failure was not explained'
 
+invalid_patch_repo=$work_dir/invalid-patch-repo
+cp -a "$valid_repo" "$invalid_patch_repo"
+printf '\n' >>"$invalid_patch_repo/patches/ocproxy-upload-performance.patch"
+
+if FAKE_DOCKER_LOG=$fake_log DOCKER_BIN=$fake_docker \
+	"$invalid_patch_repo/scripts/build.sh" --check \
+	>"$work_dir/invalid-patch.out" 2>&1; then
+	fail 'a modified ocproxy performance patch was accepted'
+fi
+
+grep -Fq 'ocproxy performance patch does not match versions.env' \
+	"$work_dir/invalid-patch.out" ||
+	fail 'modified ocproxy patch failure was not explained'
+
+FAKE_DOCKER_LOG=$fake_log DOCKER_BIN=$fake_docker \
+	"$invalid_patch_repo/scripts/build.sh" --check --auth-only \
+	>"$work_dir/auth-invalid-patch.out"
+
+grep -Fq 'ocproxy_source=not-applicable' "$work_dir/auth-invalid-patch.out" ||
+	fail 'auth-only preflight depends on the tunnel-only ocproxy patch'
+
 # An auth-only build has no dependency on the tunnel-only ocproxy source.
 FAKE_DOCKER_LOG=$fake_log DOCKER_BIN=$fake_docker \
 	"$invalid_lock_repo/scripts/build.sh" --check --auth-only \
@@ -70,7 +92,7 @@ FAKE_DOCKER_LOG=$fake_log DOCKER_BIN=$fake_docker \
 
 for marker in \
 	'scope=all' \
-	'ocproxy_source=upstream-git' \
+	'ocproxy_source=upstream-git+locked-performance-patch' \
 	'auth=isecsp-local' \
 	'alpine_mirror=default' \
 	'ubuntu_mirror=default' \

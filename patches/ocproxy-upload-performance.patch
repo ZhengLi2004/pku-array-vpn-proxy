@@ -1,0 +1,491 @@
+diff --git a/src/lwipopts.h b/src/lwipopts.h
+index 800b51b..9e9b398 100644
+--- a/src/lwipopts.h
++++ b/src/lwipopts.h
+@@ -96,7 +96,7 @@ extern unsigned char debug_flags;
+ 
+ /* MEM_SIZE: the size of the heap memory. If the application will send
+    a lot of data that needs to be copied, this should be set high. */
+-#define MEM_SIZE                1024000
++#define MEM_SIZE                (4U * 1024U * 1024U)
+ 
+ /* MEMP_NUM_PBUF: the number of memp struct pbufs. If the application
+    sends a lot of data out of ROM (or other static memory), this
+@@ -159,11 +159,15 @@ extern unsigned char debug_flags;
+    order. Define to 0 if your device is low on memory. */
+ #define TCP_QUEUE_OOSEQ         1
+ 
++/* Use a wide sender window without increasing the receive window. */
++#define LWIP_WND_SCALE          1
++#define TCP_RCV_SCALE           0
++
+ /* TCP Maximum segment size. */
+ #define TCP_MSS                 1024
+ 
+ /* TCP sender buffer space (bytes). */
+-#define TCP_SND_BUF             65534 /* Match TCP_WND. */
++#define TCP_SND_BUF             (256U * 1024U)
+ 
+ /* TCP sender buffer space (pbufs). This must be at least = 2 *
+    TCP_SND_BUF/TCP_MSS for things to work. */
+diff --git a/src/ocproxy.c b/src/ocproxy.c
+index 8b92b5d..d1af893 100644
+--- a/src/ocproxy.c
++++ b/src/ocproxy.c
+@@ -34,6 +34,7 @@
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <stddef.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <arpa/inet.h>
+@@ -79,6 +80,11 @@ enum {
+ #define MAX_IOVEC		128
+ #define MAX_CONN		1024
+ 
++#define VPN_QUEUE_MAX_BYTES	(8U * 1024U * 1024U)
++#define VPN_QUEUE_HIGH_WATER	(2U * 1024U * 1024U)
++#define VPN_QUEUE_LOW_WATER	(512U * 1024U)
++#define VPN_QUEUE_DRAIN_BYTES	(256U * 1024U)
++
+ #define SOCKS_VER		0x05
+ 
+ #define SOCKS_CMD_CONNECT	0x01
+@@ -101,6 +107,7 @@ enum {
+ 
+ struct ocp_sock {
+ 	/* general */
++	int in_use;
+ 	int fd;
+ 	struct evconnlistener *listener;
+ 	struct event *ev;
+@@ -112,6 +119,7 @@ struct ocp_sock {
+ 	/* for TCP send/receive */
+ 	int done_len;
+ 	int lwip_blocked;
++	int read_deferred;
+ 	int sock_pos;
+ 	int sock_total;
+ 	char sockbuf[SOCKBUF_LEN];
+@@ -130,6 +138,12 @@ struct ocp_sock {
+ 	struct netif *netif;
+ };
+ 
++struct vpn_packet {
++	struct vpn_packet *next;
++	size_t len;
++	unsigned char data[];
++};
++
+ struct socks_auth {
+ 	u8_t ver;
+ 	u8_t n_methods;
+@@ -171,6 +185,17 @@ static struct ocp_sock *ocp_sock_free_list;
+ static struct ocp_sock *ocp_sock_bind_list;
+ static int ocp_sock_used;
+ static int ocp_sock_max;
++static struct event *vpn_write_event;
++static struct vpn_packet *vpn_queue_head;
++static struct vpn_packet *vpn_queue_tail;
++static size_t vpn_queue_bytes;
++static size_t vpn_queue_packets;
++static size_t vpn_queue_peak_bytes;
++static unsigned long vpn_queue_enqueued;
++static unsigned long vpn_queue_retried;
++static unsigned long vpn_queue_overflows;
++static unsigned long vpn_queue_errors;
++static int vpn_output_paused;
+ 
+ /* nonstatic debug cmd option, exported in lwipopts.h */
+ unsigned char debug_flags = 0;
+@@ -184,6 +209,7 @@ static char *dns_domain;
+ 
+ static void start_connection(struct ocp_sock *s, ip_addr_t *ipaddr);
+ static void start_resolution(struct ocp_sock *s, const char *hostname);
++static void vpn_conn_down(void);
+ 
+ /**********************************************************************
+  * Utility functions / libevent wrappers
+@@ -240,6 +266,7 @@ static struct ocp_sock *ocp_sock_new(int fd, event_callback_fn cb, int flags)
+ 	}
+ 	ocp_sock_free_list = s->next;
+ 	memset(s, 0, sizeof(*s));
++	s->in_use = 1;
+ 
+ 	ocp_sock_used++;
+ 	if (ocp_sock_used > ocp_sock_max)
+@@ -271,11 +298,61 @@ static void ocp_sock_del(struct ocp_sock *s)
+ 	}
+ 	event_free(s->ev);
+ 	memset(s, 0xdd, sizeof(*s));
++	s->in_use = 0;
+ 	s->next = ocp_sock_free_list;
+ 	ocp_sock_free_list = s;
+ 	ocp_sock_used--;
+ }
+ 
++static void local_read_arm(struct ocp_sock *s)
++{
++	if (vpn_output_paused) {
++		s->read_deferred = 1;
++		return;
++	}
++
++	s->read_deferred = 0;
++	if (event_add(s->ev, NULL) < 0)
++		die("can't arm local socket event\n");
++}
++
++static void vpn_set_backpressure(int enabled)
++{
++	struct ocp_sock *s;
++	int i;
++
++	if (vpn_output_paused == enabled)
++		return;
++	vpn_output_paused = enabled;
++
++	for (i = 0; i < MAX_CONN; i++) {
++		s = &ocp_sock_pool[i];
++		if (!s->in_use)
++			continue;
++
++		if (s->listener) {
++			if (enabled) {
++				if (evconnlistener_disable(s->listener) < 0)
++					die("can't pause listener\n");
++			} else if (evconnlistener_enable(s->listener) < 0)
++				die("can't resume listener\n");
++		}
++
++		if (!s->ev || s->netif)
++			continue;
++		if (enabled) {
++			if (event_pending(s->ev, EV_READ, NULL)) {
++				event_del(s->ev);
++				s->read_deferred = 1;
++			}
++		} else if (s->read_deferred) {
++			s->read_deferred = 0;
++			if (!s->lwip_blocked && event_add(s->ev, NULL) < 0)
++				die("can't resume local socket event\n");
++		}
++	}
++}
++
+ /**********************************************************************
+  * lwIP TCP<->socket TCP traffic
+  **********************************************************************/
+@@ -288,6 +365,11 @@ static void local_data_cb(evutil_socket_t fd, short what, void *ctx)
+ 	int try_len;
+ 	err_t err;
+ 
++	if (vpn_output_paused) {
++		s->read_deferred = 1;
++		return;
++	}
++
+ 	try_len = tcp_sndbuf(s->tpcb);
+ 	if (try_len > SOCKBUF_LEN)
+ 		try_len = SOCKBUF_LEN;
+@@ -308,7 +390,7 @@ static void local_data_cb(evutil_socket_t fd, short what, void *ctx)
+ 		warn("tcp_write returned %d\n", (int)err);
+ 
+ 	tcp_output(s->tpcb);
+-	event_add(s->ev, NULL);
++	local_read_arm(s);
+ }
+ 
+ /* Called when lwIP has sent data to the VPN */
+@@ -321,7 +403,7 @@ static err_t sent_cb(void *ctx, struct tcp_pcb *tpcb, u16_t len)
+ 
+ 	if (s->lwip_blocked) {
+ 		s->lwip_blocked = 0;
+-		event_add(s->ev, NULL);
++		local_read_arm(s);
+ 	}
+ 
+ 	return ERR_OK;
+@@ -408,6 +490,11 @@ static void socks_cmd_cb(evutil_socket_t fd, short what, void *ctx)
+ 	struct socks_req *req = (void *)s->sockbuf;
+ 	ip_addr_t ip;
+ 
++	if (vpn_output_paused) {
++		s->read_deferred = 1;
++		return;
++	}
++
+ 	if (s->state == STATE_DATA) {
+ 		/* we're done with the SOCKS negotiation so just pass data */
+ 		local_data_cb(fd, what, ctx);
+@@ -472,7 +559,7 @@ static void socks_cmd_cb(evutil_socket_t fd, short what, void *ctx)
+ 	}
+ 
+ req_more:
+-	event_add(s->ev, NULL);
++	local_read_arm(s);
+ 	return;
+ 
+ disconnect:
+@@ -505,9 +592,11 @@ static err_t connect_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
+ 
+ 	if (s->conn_type == CONN_TYPE_SOCKS)
+ 		socks_reply(s, SOCKS_OK);
++	if (!s->in_use)
++		return ERR_OK;
+ 
+ 	s->state = STATE_DATA;
+-	event_add(s->ev, NULL);
++	local_read_arm(s);
+ 	tcp_recv(tpcb, recv_cb);
+ 	tcp_sent(tpcb, sent_cb);
+ 
+@@ -643,7 +732,7 @@ static void new_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
+ 		start_resolution(s, lsock->rhost_name);
+ 	} else {
+ 		s->state = STATE_SOCKS_AUTH;
+-		event_add(s->ev, NULL);
++		local_read_arm(s);
+ 	}
+ }
+ 
+@@ -651,6 +740,101 @@ static void new_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
+  * lwIP<->VPN traffic
+  **********************************************************************/
+ 
++static int vpn_queue_packet(struct pbuf *p, size_t total)
++{
++	struct vpn_packet *packet;
++	struct pbuf *q;
++	unsigned char *dst;
++
++	if (total > VPN_QUEUE_MAX_BYTES ||
++	    vpn_queue_bytes > VPN_QUEUE_MAX_BYTES - total) {
++		vpn_queue_overflows++;
++		LINK_STATS_INC(link.drop);
++		warn("VPN output queue overflow (%zu bytes queued)\n",
++		     vpn_queue_bytes);
++		vpn_conn_down();
++		return -1;
++	}
++
++	packet = malloc(sizeof(*packet) + total);
++	if (!packet)
++		die("out of memory queueing VPN packet\n");
++	packet->next = NULL;
++	packet->len = total;
++	dst = packet->data;
++	for (q = p; q; q = q->next) {
++		memcpy(dst, q->payload, q->len);
++		dst += q->len;
++	}
++
++	if (vpn_queue_tail)
++		vpn_queue_tail->next = packet;
++	else
++		vpn_queue_head = packet;
++	vpn_queue_tail = packet;
++	vpn_queue_bytes += total;
++	vpn_queue_packets++;
++	vpn_queue_enqueued++;
++	if (vpn_queue_bytes > vpn_queue_peak_bytes)
++		vpn_queue_peak_bytes = vpn_queue_bytes;
++
++	if (vpn_queue_bytes >= VPN_QUEUE_HIGH_WATER)
++		vpn_set_backpressure(1);
++	if (event_add(vpn_write_event, NULL) < 0)
++		die("can't arm VPN output event\n");
++	return 0;
++}
++
++static void vpn_write_cb(evutil_socket_t fd, short what, void *ctx)
++{
++	struct ocp_sock *s = ctx;
++	size_t drained = 0;
++
++	while (vpn_queue_head && drained < VPN_QUEUE_DRAIN_BYTES) {
++		struct vpn_packet *packet = vpn_queue_head;
++		ssize_t ret;
++
++		do {
++			ret = write(s->fd, packet->data, packet->len);
++		} while (ret < 0 && errno == EINTR);
++
++		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++			break;
++		if (ret < 0) {
++			vpn_queue_errors++;
++			LINK_STATS_INC(link.drop);
++			if (errno != ECONNREFUSED && errno != ENOTCONN &&
++			    errno != EPIPE)
++				warn("VPN output retry failed: %s\n", strerror(errno));
++			vpn_conn_down();
++			return;
++		}
++		if ((size_t)ret != packet->len) {
++			vpn_queue_errors++;
++			LINK_STATS_INC(link.lenerr);
++			warn("VPN datagram was only partially written\n");
++			vpn_conn_down();
++			return;
++		}
++
++		vpn_queue_head = packet->next;
++		if (!vpn_queue_head)
++			vpn_queue_tail = NULL;
++		vpn_queue_bytes -= packet->len;
++		vpn_queue_packets--;
++		drained += packet->len;
++		vpn_queue_retried++;
++		LINK_STATS_INC(link.xmit);
++		free(packet);
++
++		if (vpn_output_paused && vpn_queue_bytes <= VPN_QUEUE_LOW_WATER)
++			vpn_set_backpressure(0);
++	}
++
++	if (vpn_queue_head && event_add(vpn_write_event, NULL) < 0)
++		die("can't rearm VPN output event\n");
++}
++
+ static void vpn_conn_down(void)
+ {
+ 	printf("ocproxy: VPN connection has terminated\n");
+@@ -664,10 +848,17 @@ static void lwip_data_cb(evutil_socket_t fd, short what, void *ctx)
+ 	ssize_t len;
+ 	struct pbuf *p;
+ 
+-	len = read(s->fd, s->sockbuf, SOCKBUF_LEN);
++	do {
++		len = read(s->fd, s->sockbuf, SOCKBUF_LEN);
++	} while (len < 0 && errno == EINTR);
++	if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++		event_add(s->ev, NULL);
++		return;
++	}
+ 	if (len <= 0) {
+ 		/* This might never happen, because s->fd is a DGRAM socket */
+ 		vpn_conn_down();
++		return;
+ 	}
+ 	if ((p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL)) != NULL) {
+ 		char *bufptr;
+@@ -696,7 +887,8 @@ static void lwip_data_cb(evutil_socket_t fd, short what, void *ctx)
+ static err_t lwip_data_out(struct netif *netif, struct pbuf *p, ip_addr_t *ipaddr)
+ {
+ 	struct ocp_sock *s = netif->state;
+-	int i = 0, total = 0;
++	struct pbuf *first = p;
++	int i = 0, total = 0, too_many = 0;
+ 	ssize_t ret;
+ 	struct iovec iov[MAX_IOVEC];
+ 
+@@ -704,26 +896,44 @@ static err_t lwip_data_out(struct netif *netif, struct pbuf *p, ip_addr_t *ipadd
+ 		tcpdump(p);
+ 
+ 	for (; p; p = p->next) {
+-		if (i >= MAX_IOVEC) {
+-			warn("%s: too many chunks, dropping packet\n", __func__);
+-			return ERR_OK;
++		if (i < MAX_IOVEC) {
++			iov[i].iov_base = p->payload;
++			iov[i++].iov_len = p->len;
++		} else {
++			too_many = 1;
+ 		}
+-		iov[i].iov_base = p->payload;
+-		iov[i++].iov_len = p->len;
+ 		total += p->len;
+ 	}
+ 
+-	ret = writev(s->fd, iov, i);
++	if (vpn_queue_head || too_many)
++		goto queue;
++
++	do {
++		ret = writev(s->fd, iov, i);
++	} while (ret < 0 && errno == EINTR);
+ 	if (ret < 0) {
+-		if (errno == ECONNREFUSED || errno == ENOTCONN)
+-			vpn_conn_down();
+-		else
+-			LINK_STATS_INC(link.drop);
+-	} else if (ret != total)
++		if (errno == EAGAIN || errno == EWOULDBLOCK)
++			goto queue;
++		vpn_queue_errors++;
++		LINK_STATS_INC(link.drop);
++		if (errno != ECONNREFUSED && errno != ENOTCONN &&
++		    errno != EPIPE)
++			warn("VPN output failed: %s\n", strerror(errno));
++		vpn_conn_down();
++	} else if (ret != total) {
++		vpn_queue_errors++;
+ 		LINK_STATS_INC(link.lenerr);
+-	else
++		warn("VPN datagram was only partially written\n");
++		vpn_conn_down();
++	} else {
+ 		LINK_STATS_INC(link.xmit);
++	}
++
++	return ERR_OK;
+ 
++queue:
++	if (vpn_queue_packet(first, (size_t)total) < 0)
++		return ERR_IF;
+ 	return ERR_OK;
+ }
+ 
+@@ -770,7 +980,7 @@ static void cb_housekeeping(evutil_socket_t fd, short what, void *ctx)
+ 	 * OpenConnect will ignore 0-byte datagrams if it's alive, but
+ 	 * we'll get ECONNREFUSED if the peer has died.
+ 	 */
+-	if (write(*vpnfd, vpnfd, 0) < 0 &&
++	if (!vpn_queue_head && write(*vpnfd, vpnfd, 0) < 0 &&
+ 	    (errno == ECONNREFUSED || errno == ENOTCONN))
+ 		vpn_conn_down();
+ 	else if (got_sighup)
+@@ -781,6 +991,11 @@ static void cb_housekeeping(evutil_socket_t fd, short what, void *ctx)
+ 		MEM_STATS_DISPLAY();
+ 		printf("open connections: %d / %d, max %d\n",
+ 		       ocp_sock_used, MAX_CONN, ocp_sock_max);
++		printf("VPN output queue: packets %zu, bytes %zu, peak %zu, "
++		       "queued %lu, retried %lu, overflows %lu, errors %lu\n",
++		       vpn_queue_packets, vpn_queue_bytes, vpn_queue_peak_bytes,
++		       vpn_queue_enqueued, vpn_queue_retried,
++		       vpn_queue_overflows, vpn_queue_errors);
+ 		got_sigusr1 = 0;
+ 	}
+ }
+@@ -909,7 +1124,7 @@ static struct option longopts[] = {
+ 
+ int main(int argc, char **argv)
+ {
+-	int opt, i, vpnfd;
++	int opt, i, vpnfd, vpnfd_flags;
+ 	char *str;
+ 	char *ip_str, *mtu_str, *dns_str;
+ 	ip_addr_t ip, netmask, gw, dns;
+@@ -930,6 +1145,10 @@ int main(int argc, char **argv)
+ 	if (!str)
+ 		die("VPNFD is not set, aborting\n");
+ 	vpnfd = ocp_atoi(str);
++	vpnfd_flags = fcntl(vpnfd, F_GETFL, 0);
++	if (vpnfd_flags < 0 ||
++	    fcntl(vpnfd, F_SETFL, vpnfd_flags | O_NONBLOCK) < 0)
++		die("can't make VPNFD nonblocking: %s\n", strerror(errno));
+ 
+ 	/* try to set the IP configuration from the environment, first */
+ 	ip_str = getenv("INTERNAL_IP4_ADDRESS");
+@@ -1003,6 +1222,9 @@ int main(int argc, char **argv)
+ 
+ 	/* Set up lwIP interface */
+ 	s = ocp_sock_new(vpnfd, lwip_data_cb, FL_ACTIVATE | FL_DIE_ON_ERROR);
++	vpn_write_event = event_new(event_base, vpnfd, EV_WRITE, vpn_write_cb, s);
++	if (!vpn_write_event)
++		die("can't create VPN output event\n");
+ 	memset(&netif, 0, sizeof(netif));
+ 	s->netif = &netif;
+ 

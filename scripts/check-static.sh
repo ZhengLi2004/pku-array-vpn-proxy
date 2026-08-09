@@ -25,6 +25,9 @@ require_text() {
 
 cd "$repo_dir"
 
+require_line .gitattributes 'patches/*.patch text eol=lf -whitespace' \
+	'ocproxy patch bytes must remain stable across host line-ending settings'
+
 for source_file in scripts/*.sh scripts/*.py scripts/*.exp \
 	tests/*.sh tests/*.py Dockerfile Dockerfile.isecsp-auth \
 	Dockerfile.isecsp-auth.dockerignore Makefile src/isecsp-auth/Makefile \
@@ -107,6 +110,8 @@ require_line NOTICE 'Copyright 2026 ZhengLi2004 and contributors' \
 
 for marker in 'LGPL-2.1-only' 'BSD-3-Clause' \
 	'c98f06d942970cdf35dd66ab46840f7d6d567b60' \
+	'patches/ocproxy-upload-performance.patch' \
+	'beab1230018ac3fc3c9635a060b5c251a4c3707eee51c94425c309a1ed1232bf' \
 	'Local-only iSecSP authentication backend'; do
 	require_text THIRD_PARTY_NOTICES.md "$marker" \
 		"third-party notice lacks $marker"
@@ -138,6 +143,7 @@ for lock in \
 	'DOCKERFILE_FRONTEND_IMAGE=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e' \
 	'OPENCONNECT_COMMIT=8b702bf2dbaf11302ed98629214b1df5d50a12aa' \
 	'OCPROXY_COMMIT=c98f06d942970cdf35dd66ab46840f7d6d567b60' \
+	'OCPROXY_PERFORMANCE_PATCH_SHA256=beab1230018ac3fc3c9635a060b5c251a4c3707eee51c94425c309a1ed1232bf' \
 	'ALPINE_IMAGE=alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b' \
 	'UBUNTU_IMAGE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea' \
 	'ISECSP_DEB_SHA256=4b062dfa4a9a89cbb60d538b1cc3cb47d014ff91e907db16c891fcd9ebd91d6c' \
@@ -152,15 +158,67 @@ if grep -Eq '(^|_)(MIRROR|REPOSITORY)=' versions.env; then
 fi
 
 ocproxy_commit=$(sed -n 's/^OCPROXY_COMMIT=//p' versions.env)
+ocproxy_patch_sha=$(sed -n 's/^OCPROXY_PERFORMANCE_PATCH_SHA256=//p' versions.env)
+ocproxy_patch=patches/ocproxy-upload-performance.patch
 
 [[ $ocproxy_commit =~ ^[0-9a-f]{40}$ ]] ||
 	fail 'ocproxy commit lock is malformed'
 
+[[ $ocproxy_patch_sha =~ ^[0-9a-f]{64}$ ]] ||
+	fail 'ocproxy performance patch lock is malformed'
+
+[[ -f $ocproxy_patch && ! -L $ocproxy_patch ]] ||
+	fail 'ocproxy performance patch is missing or is a symlink'
+
+git check-ignore -q "$ocproxy_patch" &&
+	fail 'ocproxy performance patch is excluded from source control'
+
+git ls-files --error-unmatch "$ocproxy_patch" >/dev/null 2>&1 ||
+	fail 'ocproxy performance patch is not tracked by Git'
+
+[[ $(sha256sum "$ocproxy_patch" | awk '{print $1}') == "$ocproxy_patch_sha" ]] ||
+	fail 'ocproxy performance patch does not match versions.env'
+
+mapfile -t ocproxy_patch_targets < <(
+	git apply --numstat -- "$ocproxy_patch" | awk '{print $3}' | LC_ALL=C sort
+)
+
+[[ ${#ocproxy_patch_targets[@]} -eq 2 &&
+	${ocproxy_patch_targets[0]} == src/lwipopts.h &&
+	${ocproxy_patch_targets[1]} == src/ocproxy.c ]] ||
+	fail 'ocproxy performance patch modifies an unexpected path'
+
+for marker in \
+	'#define MEM_SIZE                (4U * 1024U * 1024U)' \
+	'#define LWIP_WND_SCALE          1' \
+	'#define TCP_RCV_SCALE           0' \
+	'#define TCP_MSS                 1024' \
+	'#define TCP_SND_BUF             (256U * 1024U)' \
+	'VPN_QUEUE_MAX_BYTES' \
+	'O_NONBLOCK' \
+	'EV_WRITE' \
+	'vpn_set_backpressure' \
+	'VPN output queue overflow'; do
+	require_text "$ocproxy_patch" "$marker" \
+		"ocproxy performance patch lacks $marker"
+done
+
+if grep -Eq '^[+-]#define (TCP_MSS|TCP_WND)[[:space:]]' "$ocproxy_patch"; then
+	fail 'the first performance patch must preserve ocproxy TCP_MSS and TCP_WND'
+fi
+
 for marker in \
 	"ARG OCPROXY_COMMIT=$ocproxy_commit" \
+	"ARG OCPROXY_PERFORMANCE_PATCH_SHA256=$ocproxy_patch_sha" \
+	"test \"\$OCPROXY_PERFORMANCE_PATCH_SHA256\" = \"$ocproxy_patch_sha\"" \
 	'git remote add origin https://github.com/cernekee/ocproxy.git' \
 	'git -c http.version=HTTP/1.1 fetch --depth=1 --no-tags' \
 	'test "$(git rev-parse HEAD)" = "$OCPROXY_COMMIT"' \
+	'COPY patches/ocproxy-upload-performance.patch /build/patches/ocproxy-upload-performance.patch' \
+	'sha256sum -c -' \
+	'git -C /build/ocproxy apply --check --whitespace=error-all' \
+	'git -C /build/ocproxy apply --whitespace=error-all' \
+	'git -C /build/ocproxy diff --check' \
 	'--with-gnutls' \
 	'--without-openssl' \
 	'src/auth-ipc/client.c' \
@@ -224,6 +282,7 @@ for marker in \
 	'array-auth:' \
 	'dockerfile: Dockerfile.isecsp-auth' \
 	'${PKU_ARRAY_VPN_IMAGE:-pku-array-vpn-proxy:local}' \
+	'VPN_DATA_TRANSPORT: ${VPN_DATA_TRANSPORT:-tls}' \
 	'pku-array-vpn-auth:isecsp-local' \
 	'UBUNTU_APT_MIRROR: ${UBUNTU_APT_MIRROR:-}' \
 	'${ARRAYVPN_UID:?run ./scripts/init-secrets.sh}' \
@@ -290,9 +349,33 @@ jq_sha=$(sed -n 's/^JQ_APK_SHA256=//p' versions.env)
 require_text Dockerfile "ARG JQ_APK_SHA256=$jq_sha" \
 	'Dockerfile does not verify the locked jq APK'
 
-if grep -Eq 'git apply|COPY patches/' Dockerfile ||
-	grep -Eq '^OPENCONNECT_.*PATCH' versions.env; then
+if grep -Eq '^OPENCONNECT_.*PATCH' versions.env ||
+	sed -n '/RUN git init openconnect/,/^COPY patches\/ocproxy-upload-performance\.patch/p' \
+		Dockerfile | grep -Eq 'git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+apply|(^|&&[[:space:]]+)patch[[:space:]]'; then
 	fail 'OpenConnect must be built from the unmodified locked upstream commit'
+fi
+
+[[ $(grep -Ec 'git -C /build/ocproxy apply( --check)? --whitespace=error-all' \
+	Dockerfile) -eq 2 ]] ||
+	fail 'Dockerfile must apply only the locked ocproxy performance patch'
+
+[[ $(grep -Ec 'git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+apply([[:space:]]|$)' \
+	Dockerfile) -eq 2 ]] ||
+	fail 'Dockerfile contains an additional source patch operation'
+
+require_text Dockerfile \
+	$'git -C /build/ocproxy apply --check --whitespace=error-all \\\n     /build/patches/ocproxy-upload-performance.patch' \
+	'Dockerfile checks the wrong ocproxy performance patch'
+
+require_text Dockerfile \
+	$'git -C /build/ocproxy apply --whitespace=error-all \\\n     /build/patches/ocproxy-upload-performance.patch' \
+	'Dockerfile applies the wrong ocproxy performance patch'
+
+[[ $(grep -Fc 'COPY patches/' Dockerfile) -eq 1 ]] ||
+	fail 'Dockerfile must copy only the locked ocproxy performance patch'
+
+if grep -Eq '(^|&&[[:space:]]+)patch[[:space:]]' Dockerfile; then
+	fail 'Dockerfile contains an unreviewed patch command'
 fi
 
 [[ $(head -n 1 scripts/openconnect-driver.exp) == '#!/usr/bin/expect -f' ]] ||
@@ -301,7 +384,13 @@ fi
 for driver_marker in \
 	'^ANsession[A-Za-z0-9_.-]*=[^\x00-\x20\x7f;]+$' \
 	'--protocol=array' \
-	'--resolve=[format' \
+	'--resolve=[format "%s:%s" $array_host $candidate]' \
+	'set data_transport "tls"' \
+	'env(VPN_DATA_TRANSPORT)' \
+	'{^(auto|tls)$}' \
+	'if {$data_transport eq "tls"}' \
+	'lappend command --no-dtls' \
+	'DRIVER_TRANSPORT_INVALID' \
 	'lappend command --servercert=$pin' \
 	'%UNSAFE_RENEGOTIATION:-3DES-CBC:-ARCFOUR-128' \
 	'--cookie-on-stdin' \
@@ -310,6 +399,9 @@ for driver_marker in \
 	require_text scripts/openconnect-driver.exp "$driver_marker" \
 		"OpenConnect driver lacks $driver_marker"
 done
+
+require_line .env.example 'VPN_DATA_TRANSPORT=tls' \
+	'.env.example must preserve the TLS-only data transport default'
 
 if grep -Fq -- '--cookie=' scripts/openconnect-driver.exp; then
 	fail 'session cookies must not appear in the OpenConnect argument vector'

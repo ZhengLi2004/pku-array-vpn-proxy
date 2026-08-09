@@ -6,6 +6,7 @@
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS builder
 ARG OPENCONNECT_COMMIT=8b702bf2dbaf11302ed98629214b1df5d50a12aa
 ARG OCPROXY_COMMIT=c98f06d942970cdf35dd66ab46840f7d6d567b60
+ARG OCPROXY_PERFORMANCE_PATCH_SHA256=beab1230018ac3fc3c9635a060b5c251a4c3707eee51c94425c309a1ed1232bf
 ARG JQ_APK_VERSION=1.8.2-r0
 ARG JQ_APK_SHA256=a2ec9dca2378a9e62e4bbb63ff7f0223e4ac5a6a53acac74889f8d15b91578d8
 ARG ALPINE_MIRROR
@@ -69,6 +70,12 @@ RUN cd /build/openconnect \
      && rm -rf \
      /out/openconnect/usr/local/lib/pkgconfig
 
+COPY patches/ocproxy-upload-performance.patch /build/patches/ocproxy-upload-performance.patch
+
+RUN test "$OCPROXY_PERFORMANCE_PATCH_SHA256" = "beab1230018ac3fc3c9635a060b5c251a4c3707eee51c94425c309a1ed1232bf" \
+     && echo "$OCPROXY_PERFORMANCE_PATCH_SHA256  /build/patches/ocproxy-upload-performance.patch" | \
+     sha256sum -c -
+
 RUN test "$OCPROXY_COMMIT" = "c98f06d942970cdf35dd66ab46840f7d6d567b60" \
      && git init -q ocproxy \
      && cd /build/ocproxy \
@@ -85,6 +92,11 @@ RUN test "$OCPROXY_COMMIT" = "c98f06d942970cdf35dd66ab46840f7d6d567b60" \
      && test "$fetched" -eq 1 \
      && git checkout --detach FETCH_HEAD \
      && test "$(git rev-parse HEAD)" = "$OCPROXY_COMMIT" \
+     && git -C /build/ocproxy apply --check --whitespace=error-all \
+     /build/patches/ocproxy-upload-performance.patch \
+     && git -C /build/ocproxy apply --whitespace=error-all \
+     /build/patches/ocproxy-upload-performance.patch \
+     && git -C /build/ocproxy diff --check \
      && ./autogen.sh \
      && ./configure --disable-vpnns \
      && make -j"$(getconf _NPROCESSORS_ONLN)" \

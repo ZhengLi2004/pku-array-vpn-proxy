@@ -37,12 +37,14 @@ ALPINE_MIRROR= \
 	UBUNTU_APT_MIRROR= \
 	UBUNTU_IMAGE= \
 	PKU_ARRAY_VPN_IMAGE= \
+	VPN_DATA_TRANSPORT= \
 	docker compose config --format json >"$compose_json"
 
 ALPINE_MIRROR=https://mirror.example/alpine \
 	UBUNTU_APT_MIRROR=https://mirror.example/ubuntu \
 	UBUNTU_IMAGE=registry.example/ubuntu:24.04@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
 	PKU_ARRAY_VPN_IMAGE=ghcr.io/example/pku-array-vpn-proxy:v1 \
+	VPN_DATA_TRANSPORT=auto \
 	docker compose config --format json >"$override_compose_json"
 
 python3 - "$compose_json" "$override_compose_json" \
@@ -70,6 +72,7 @@ for service in (tunnel, auth):
 assert tunnel["build"]["dockerfile"] == "Dockerfile"
 assert tunnel["build"]["args"] == {"ALPINE_MIRROR": ""}
 assert tunnel["image"] == "pku-array-vpn-proxy:local"
+assert tunnel["environment"]["VPN_DATA_TRANSPORT"] == "tls"
 
 assert override_config["services"]["pku-array-vpn"]["build"]["args"] == {
     "ALPINE_MIRROR": "https://mirror.example/alpine"
@@ -78,6 +81,12 @@ assert override_config["services"]["pku-array-vpn"]["build"]["args"] == {
 assert (
     override_config["services"]["pku-array-vpn"]["image"]
     == "ghcr.io/example/pku-array-vpn-proxy:v1"
+)
+
+assert (
+    override_config["services"]["pku-array-vpn"]["environment"]
+    ["VPN_DATA_TRANSPORT"]
+    == "auto"
 )
 
 assert auth["build"]["dockerfile"] == "Dockerfile.isecsp-auth"

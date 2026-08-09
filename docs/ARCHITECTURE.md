@@ -28,8 +28,8 @@ pku-array-vpn
 | `pku-array-vpn` | 解析公开入口 IP、预检 SPKI、监督隧道、运行 OpenConnect 与 ocproxy |
 | `array-auth` | 读取 secrets、调用本地 iSecSP 认证组件、缓存 `ANsession`、提供回环 IPC |
 | authentication adapter | 限制组件的目标地址、证书、认证轮次、挑战类型、Cookie 与日志输出 |
-| OpenConnect | 使用 Array 数据协议建立 TLS 隧道，并把网络参数传给 ocproxy |
-| ocproxy | 把 OpenConnect 的 script-tun 接口转换为 TCP SOCKS5 |
+| OpenConnect | 使用 Array 数据协议建立数据隧道；默认 TLS，`auto` 模式允许协商 DTLS并自动回退 |
+| ocproxy | 把 OpenConnect 的 script-tun 接口转换为 TCP SOCKS5，并以有界队列处理 VPNFD 背压 |
 | supervisor | 管理候选 IP、退避、健康状态与会话失效 |
 
 ## 容器与网络
@@ -75,7 +75,7 @@ sidecar 在内存中缓存成功 Cookie，使隧道启动阶段的瞬时错误�
 
 ## 构建与发布结构
 
-`Dockerfile` 构建 OpenConnect、哈希锁定的 ocproxy 与认证 IPC client，生成可以公开发布的隧道镜像。
+`Dockerfile` 构建 OpenConnect、提交与性能补丁均哈希锁定的 ocproxy，以及认证 IPC client，生成可以公开发布的隧道镜像。
 
 `Dockerfile.isecsp-auth` 从用户提供、Git 忽略且哈希锁定的官方包中静态提取
 `libvl3vpn.so` 与 `libisec.so`，并编译项目自带隔离适配器。
